@@ -46,7 +46,7 @@ def get_logger(name: str, level: Optional[str] = None) -> logging.Logger:
     # Add handler
     logger.addHandler(rich_handler)
     
-    # Prevent propagation to root logger
-    logger.propagate = False
+    # Allow propagation so server-side collectors (e.g., per-run handler) can capture logs
+    logger.propagate = True
     
     return logger

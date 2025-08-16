@@ -1,6 +1,6 @@
 """Core test runner that orchestrates the entire testing process."""
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 from dataclasses import dataclass
 
 from datamonkey.core.test_config import TestConfig
@@ -21,7 +21,7 @@ class TestResult:
 class TestRunner:
     """Main test runner that orchestrates the entire testing process."""
     
-    def __init__(self, config_path: str):
+    def __init__(self, config_path: str, run_id: Optional[str] = None):
         """Initialize the test runner.
         
         Args:
@@ -29,6 +29,7 @@ class TestRunner:
         """
         self.config = TestConfig.from_file(config_path)
         self.logger = get_logger("test_runner")
+        self.run_id = run_id
         
     async def run_tests(self) -> List[TestResult]:
         """Run all configured tests."""
@@ -40,7 +41,7 @@ class TestRunner:
         try:
             # Use the new TestFlow system for all connectors, including GitHub
             # This ensures the YAML test_flow steps are properly executed step-by-step
-            test_flow = TestFlow.create(self.config)
+            test_flow = TestFlow.create(self.config, run_id=self.run_id)
             
             # Set up the test environment
             if not await test_flow.setup():

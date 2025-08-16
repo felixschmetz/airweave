@@ -1,0 +1,161 @@
+name: Test Suite with Debug UI 🐵
+
+on:
+  pull_request:
+
+permissions:
+  pull-requests: write
+
+jobs:
+  deploy-debug-ui:
+    name: Deploy full stack + Debug UI (ngrok)
+    runs-on: ubuntu-latest
+    outputs:
+      api_url: ${{ steps.out.outputs.api_url }}
+      ui_url: ${{ steps.out.outputs.ui_url }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq curl docker-compose
+
+      - name: Install ngrok
+        env:
+          NGROK_AUTHTOKEN: ${{ secrets.NGROK_AUTHTOKEN }}
+        run: |
+          curl -sSL https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-linux-amd64.tgz -o ngrok.tgz
+          tar -xzf ngrok.tgz
+          sudo mv ngrok /usr/local/bin/ngrok
+          ngrok authtoken "$NGROK_AUTHTOKEN"
+
+      - name: Start Airweave backend
+        run: |
+          printf 'n\nn\n' | ./start.sh
+
+      - name: Wait for Airweave backend health
+        run: |
+          for i in {1..60}; do
+            if curl -fsS http://localhost:8001/health >/dev/null; then echo OK; exit 0; fi
+            sleep 2
+          done
+          echo "Airweave backend failed to become healthy" >&2
+          exit 1
+
+      - name: Start Datamonkey backend
+        run: |
+          docker compose -f docker/docker-compose.monke.yml up -d datamonkey-backend
+
+      - name: Wait for Datamonkey backend health
+        run: |
+          for i in {1..60}; do
+            if curl -fsS http://localhost:8081/api/tests >/dev/null; then echo OK; exit 0; fi
+            sleep 2
+          done
+          echo "Datamonkey backend failed to become healthy" >&2
+          exit 1
+
+      - name: Start ngrok for Datamonkey API (8081)
+        env:
+          NGROK_API_DOMAIN: ${{ secrets.NGROK_API_DOMAIN }}
+        run: |
+          if [ -n "$NGROK_API_DOMAIN" ]; then
+            nohup ngrok http -hostname="$NGROK_API_DOMAIN" 8081 --log=stdout > ngrok_backend.log 2>&1 &
+          else
+            nohup ngrok http 8081 --log=stdout > ngrok_backend.log 2>&1 &
+            for i in {1..30}; do curl -s localhost:4040/api/tunnels >/dev/null && break; sleep 1; done
+            curl -s localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url'
+          fi
+
+      - name: Capture API URL
+        id: api
+        env:
+          NGROK_API_DOMAIN: ${{ secrets.NGROK_API_DOMAIN }}
+        run: |
+          if [ -n "$NGROK_API_DOMAIN" ]; then
+            API_URL="https://$NGROK_API_DOMAIN"
+          else
+            API_URL="$(curl -s localhost:4040/api/tunnels | jq -r '.tunnels[0].public_url')"
+          fi
+          echo "api_url=$API_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Build Datamonkey UI with API base
+        run: |
+          docker build -t dm-frontend:ci -f datamonkey/frontend/Dockerfile --build-arg VITE_API_BASE=${{ steps.api.outputs.api_url }} datamonkey/frontend
+
+      - name: Run Datamonkey UI
+        run: |
+          docker run -d --name datamonkey-frontend -p 8082:8082 dm-frontend:ci
+
+      - name: Start ngrok for Datamonkey UI (8082)
+        env:
+          NGROK_UI_DOMAIN: ${{ secrets.NGROK_UI_DOMAIN }}
+        run: |
+          if [ -n "$NGROK_UI_DOMAIN" ]; then
+            nohup ngrok http -hostname="$NGROK_UI_DOMAIN" 8082 --log=stdout >> ngrok_frontend.log 2>&1 &
+          else
+            nohup ngrok http 8082 --log=stdout >> ngrok_frontend.log 2>&1 &
+            sleep 2
+            curl -s localhost:4040/api/tunnels | jq -r '.tunnels | map(select(.config.addr=="http://localhost:8082"))[0].public_url'
+          fi
+
+      - name: Capture UI URL
+        id: ui
+        env:
+          NGROK_UI_DOMAIN: ${{ secrets.NGROK_UI_DOMAIN }}
+        run: |
+          if [ -n "$NGROK_UI_DOMAIN" ]; then
+            UI_URL="https://$NGROK_UI_DOMAIN"
+          else
+            UI_URL="$(curl -s localhost:4040/api/tunnels | jq -r '.tunnels | map(select(.config.addr=="http://localhost:8082"))[0].public_url')"
+          fi
+          echo "ui_url=$UI_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Output URLs
+        id: out
+        run: |
+          echo "api_url=${{ steps.api.outputs.api_url }}" >> "$GITHUB_OUTPUT"
+          echo "ui_url=${{ steps.ui.outputs.ui_url }}" >> "$GITHUB_OUTPUT"
+
+      - name: Comment PR with Debug UI link
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const ui = '${{ steps.ui.outputs.ui_url }}';
+            const body = `🐵 Datamonkey Debug UI: ${ui}\n\nThis environment will stay up for ~30 minutes.`;
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body
+            });
+
+      - name: Keep alive for debugging (30m)
+        if: always()
+        run: sleep 1800
+
+  run-tests:
+    name: Run tests against Debug API
+    runs-on: ubuntu-latest
+    needs: deploy-debug-ui
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install deps
+        run: sudo apt-get update && sudo apt-get install -y jq curl
+
+      - name: Trigger Datamonkey test (PASS/FAIL)
+        env:
+          DM_API_BASE: ${{ needs['deploy-debug-ui'].outputs.api_url }}
+          DM_CONFIG: configs/asana.yaml
+          DM_UI_URL: ${{ needs['deploy-debug-ui'].outputs.ui_url }}
+          POLL_INTERVAL: 5
+        run: bash .github/scripts/run_datamonkey.sh
+
+      - name: Post UI link to summary
+        if: always()
+        run: |
+          echo "Datamonkey UI: ${{ needs['deploy-debug-ui'].outputs.ui_url }}" >> "$GITHUB_STEP_SUMMARY"

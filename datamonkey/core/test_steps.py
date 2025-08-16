@@ -16,6 +16,16 @@ class TestStep(ABC):
         """Initialize the test step."""
         self.config = config
         self.logger = get_logger(f"test_step.{self.__class__.__name__}")
+
+    def _display_name(self, entity: Dict[str, Any]) -> str:
+        """Return a human-readable identifier for an entity regardless of type."""
+        return (
+            entity.get("path")
+            or entity.get("title")
+            or entity.get("id")
+            or entity.get("url")
+            or "<unknown>"
+        )
     
     @abstractmethod
     async def execute(self):
@@ -58,13 +68,11 @@ class SyncStep(TestStep):
         # Get Airweave client
         client = self._get_airweave_client()
         
-        # Trigger sync
-        sync_response = await client.run_source_connection_sync(
-            self.config._source_connection_id
-        )
+        # Trigger sync via SDK
+        client.source_connections.run_source_connection(self.config._source_connection_id)
         
         # Wait for completion
-        await self._wait_for_sync_completion(client, sync_response["id"])
+        await self._wait_for_sync_completion(client)
         
         self.logger.info("✅ Sync completed")
     
@@ -72,21 +80,20 @@ class SyncStep(TestStep):
         """Get the Airweave client instance."""
         return getattr(self.config, '_airweave_client', None)
     
-    async def _wait_for_sync_completion(self, client, sync_id: str, timeout_seconds: int = 300):
+    async def _wait_for_sync_completion(self, client, timeout_seconds: int = 300):
         """Wait for sync to complete."""
         self.logger.info("⏳ Waiting for sync to complete...")
         
         start_time = time.time()
         while time.time() - start_time < timeout_seconds:
             try:
-                # Check sync job status
-                jobs = await client.get_source_connection_jobs(
-                    self.config._source_connection_id
-                )
+                # Check sync job status via SDK
+                jobs = client.source_connections.list_source_connection_jobs(self.config._source_connection_id)
                 
                 if jobs:
-                    latest_job = jobs[0]  # Most recent job
-                    status = latest_job.get("status")
+                    latest_job = jobs[0]
+                    # Pydantic typed model; use attribute access
+                    status = getattr(latest_job, "status", None)
                     
                     self.logger.info(f"🔍 Found job with status: {status}")
                     
@@ -94,7 +101,7 @@ class SyncStep(TestStep):
                         self.logger.info("✅ Sync completed successfully")
                         return
                     elif status == "failed":
-                        error = latest_job.get("error", "Unknown error")
+                        error = getattr(latest_job, "error", "Unknown error")
                         raise Exception(f"Sync failed: {error}")
                     elif status in ["created", "pending", "in_progress"]:
                         self.logger.info(f"⏳ Sync status: {status}")
@@ -122,12 +129,12 @@ class VerifyStep(TestStep):
         # Get Airweave client
         client = self._get_airweave_client()
         
-        # Verify each entity by exact filename
+        # Verify each entity by embedded verification token (file path only as a last-resort fallback)
         for entity in self.config._created_entities:
             is_present = await self._verify_entity_in_qdrant(client, entity)
             if not is_present:
-                raise Exception(f"Entity {entity['path']} not found in Qdrant")
-            self.logger.info(f"✅ Entity {entity['path']} verified in Qdrant")
+                raise Exception(f"Entity {self._display_name(entity)} not found in Qdrant")
+            self.logger.info(f"✅ Entity {self._display_name(entity)} verified in Qdrant")
         
         self.logger.info("✅ All entities verified in Qdrant")
     
@@ -138,28 +145,34 @@ class VerifyStep(TestStep):
         return getattr(self.config, '_airweave_client', None)
     
     async def _verify_entity_in_qdrant(self, client, entity: Dict[str, Any]) -> bool:
-        """Verify a specific entity exists in Qdrant by searching for its content."""
+        """Verify a specific entity exists in Qdrant by searching for its token/content."""
         try:
-            # Prefer unique token if present
-            expected_content = entity.get("token") or entity.get("expected_content", "")
-            filename = entity["path"].split("/")[-1]
+            # Prefer unique token if present; then expected_content; then filename as last resort
+            expected_token = entity.get("token")
+            expected_content = entity.get("expected_content", "")
+            filename = (entity.get("path") or "").split("/")[-1]
+            query_string = expected_token or expected_content or filename
             
-            self.logger.info(f"🔍 Searching for entity: {filename}")
-            self.logger.info(f"🔍 Expected content: {expected_content}")
+            self.logger.info(f"🔍 Searching for entity by: {query_string}")
+            if expected_token:
+                self.logger.info(f"🔍 Expected token: {expected_token}")
+            else:
+                self.logger.info(f"🔍 Expected filename (fallback): {filename}")
             
             # First, let's see what's actually in the collection
             self.logger.info("🔍 Checking what's actually in the collection...")
-            all_results = await client.search_collection(
-                collection_id=self.config._collection_readable_id,
+            all_results_resp = client.collections.search_collection(
+                self.config._collection_readable_id,
                 query="datamonkey",
-                score_threshold=0.1
+                score_threshold=0.1,
             )
+            all_results = all_results_resp.model_dump()
             
             if all_results.get("results"):
                 self.logger.info(f"🔍 Collection contains {len(all_results['results'])} total documents")
                 for i, result in enumerate(all_results["results"][:5]):
                     payload = result.get("payload", {})
-                    name = payload.get("name", "NO_NAME")
+                    name = payload.get("name") or payload.get("title") or "NO_NAME"
                     path = payload.get("path", "NO_PATH")
                     score = result.get("score", 0)
                     self.logger.info(f"   {i+1}. Name: {name}, Path: {path}, Score: {score:.3f}")
@@ -170,32 +183,33 @@ class VerifyStep(TestStep):
             # Try with reasonable score threshold first
             # Use configurable threshold if available
             initial_threshold = self.config.verification_config.get('score_threshold', 0.5)
-            search_results = await client.search_collection(
-                collection_id=self.config._collection_readable_id,
-                query=expected_content,
-                score_threshold=initial_threshold
+            search_results_resp = client.collections.search_collection(
+                self.config._collection_readable_id,
+                query=query_string,
+                score_threshold=initial_threshold,
             )
+            search_results = search_results_resp.model_dump()
             
             self.logger.info("📊 Search results (threshold %.1f): %s" % (initial_threshold, len(search_results.get('results', []))))
             
             # If no results, try with lower threshold
             if not search_results.get("results"):
                 self.logger.info("🔍 Trying with lower score threshold...")
-                search_results = await client.search_collection(
-                    collection_id=self.config._collection_readable_id,
-                    query=expected_content,
-                    score_threshold=0.1
-                )
+                search_results = client.collections.search_collection(
+                    self.config._collection_readable_id,
+                    query=query_string,
+                    score_threshold=0.1,
+                ).model_dump()
                 self.logger.info("📊 Search results (threshold 0.1): %s" % len(search_results.get('results', [])))
             
             # If still no results, try empty search to see what's in the collection
             if not search_results.get("results"):
                 self.logger.info("🔍 Trying empty search to see collection contents...")
-                empty_search = await client.search_collection(
-                    collection_id=self.config._collection_readable_id,
+                empty_search = client.collections.search_collection(
+                    self.config._collection_readable_id,
                     query="",
-                    score_threshold=0.0
-                )
+                    score_threshold=0.0,
+                ).model_dump()
                 self.logger.info(f"📊 Empty search results: {len(empty_search.get('results', []))}")
                 
                 if empty_search.get("results"):
@@ -226,62 +240,63 @@ class VerifyStep(TestStep):
             self.logger.info(f"🔍 Found {len(reasonable_score_results)} results for content:")
             for i, result in enumerate(reasonable_score_results):
                 payload = result.get("payload", {})
-                name = payload.get("name", "NO_NAME")
+                name = payload.get("name") or payload.get("title") or "NO_NAME"
                 path = payload.get("path", "NO_PATH")
                 score = result.get("score", 0)
                 self.logger.info(f"   {i+1}. Name: {name}, Path: {path}, Score: {score:.3f}")
             
-            # Verify that our expected content exists in the reasonable-scoring results
-            expected_content = entity.get('expected_content', '')
-            expected_token = entity.get('token', expected_content)
+            # Verify that our expected token/content exists in the reasonable-scoring results
+            expected_token = (expected_token or expected_content or "")
             expected_file_found = False
             
-            # For non-file entities (like Asana tasks), check for the token in the content
+            # Check if the expected token appears in common payload text fields
             for result in reasonable_score_results:
                 payload = result.get("payload", {})
-                result_name = payload.get("name", "")
-                result_content = payload.get("content", "")
-                result_path = payload.get("path", "")
+                # Coerce to text safely (handles None, lists, dicts)
+                def _to_text(value) -> str:
+                    if value is None:
+                        return ""
+                    if isinstance(value, str):
+                        return value
+                    if isinstance(value, list):
+                        return "\n".join(_to_text(v) for v in value)
+                    if isinstance(value, dict):
+                        return str(value)
+                    return str(value)
+
+                result_name = _to_text(payload.get("name") or payload.get("title"))
+                # Consider various possible content fields across connectors
+                candidate_fields = [
+                    payload.get("content"),
+                    payload.get("notes"),
+                    payload.get("body"),
+                    payload.get("text"),
+                    payload.get("description"),
+                    payload.get("comment"),
+                    payload.get("title"),
+                    payload.get("md_content"),
+                    payload.get("md_title"),
+                ]
+                result_text_fields = [_to_text(v) for v in candidate_fields]
                 
-                # Check if the expected token appears in the name or content
-                if expected_token and (expected_token in result_name or expected_token in result_content):
+                # Check if the expected token appears in the name or any content field
+                if expected_token and (
+                    expected_token in result_name or any(expected_token in t for t in result_text_fields)
+                ):
                     expected_file_found = True
                     result_score = result.get("score", 0)
                     self.logger.info(f"✅ Found entity with expected token '{expected_token}' in results with score {result_score:.3f}: {result_name}")
                     break
             
             if not expected_file_found:
-                # Try the file-based logic for backward compatibility
-                if expected_content.startswith("Datamonkey Test File "):
-                    # Extract the file number (e.g., "1" from "Datamonkey Test File 1")
-                    parts = expected_content.split()
-                    file_number = None
-                    for i, part in enumerate(parts):
-                        if part.isdigit():
-                            file_number = part
-                            break
-                    
-                    if file_number:
-                        # Look for our expected file in all reasonable results
-                        for result in reasonable_score_results:
-                            result_path = result.get("payload", {}).get("path", "")
-                            # Check if this result contains our specific file number AND matches our expected pattern
-                            if (file_number in result_path and 
-                                f"datamonkey-test-{file_number}-" in result_path):
-                                expected_file_found = True
-                                result_score = result.get("score", 0)
-                                self.logger.info(f"✅ Found expected file {file_number} in results with score {result_score:.3f}: {result_path}")
-                                break
-                
-                if not expected_file_found:
-                    self.logger.warning(f"⚠️ Expected token '{expected_token}' not found in any reasonable-scoring results")
-                    return False
+                self.logger.warning(f"⚠️ Expected token/content '{expected_token or filename}' not found in any reasonable-scoring results")
+                return False
             
             self.logger.info(f"✅ Found {len(reasonable_score_results)} reasonable-scoring results for content")
             return True
             
         except Exception as e:
-            self.logger.error(f"❌ Verification failed for {entity['path']}: {str(e)}")
+            self.logger.error(f"❌ Verification failed for {self._display_name(entity)}: {str(e)}")
             return False
 
 
@@ -325,8 +340,8 @@ class PartialDeleteStep(TestStep):
         entities_to_delete = self.config._created_entities[:deletion_count]
         entities_to_keep = self.config._created_entities[deletion_count:]
         
-        self.logger.info(f"🗑️ Deleting {len(entities_to_delete)} entities: {[e['path'] for e in entities_to_delete]}")
-        self.logger.info(f"💾 Keeping {len(entities_to_keep)} entities: {[e['path'] for e in entities_to_keep]}")
+        self.logger.info(f"🗑️ Deleting {len(entities_to_delete)} entities: {[self._display_name(e) for e in entities_to_delete]}")
+        self.logger.info(f"💾 Keeping {len(entities_to_keep)} entities: {[self._display_name(e) for e in entities_to_keep]}")
         
         # Delete selected entities
         deleted_paths = await bongo.delete_specific_entities(entities_to_delete)
@@ -366,14 +381,14 @@ class VerifyPartialDeletionStep(TestStep):
         # Log what we expect to find deleted
         self.logger.info("🔍 Expecting these entities to be deleted:")
         for entity in self.config._partially_deleted_entities:
-            self.logger.info(f"   - {entity.get('name', entity['path'])} (token: {entity.get('token', 'N/A')})")
+            self.logger.info(f"   - {self._display_name(entity)} (token: {entity.get('token', 'N/A')})")
         
         # Verify deleted entities are removed
         for entity in self.config._partially_deleted_entities:
             is_removed = await self._verify_entity_deleted_from_qdrant(client, entity)
             if not is_removed:
-                raise Exception(f"Entity {entity['path']} still exists in Qdrant after deletion")
-            self.logger.info(f"✅ Entity {entity['path']} confirmed removed from Qdrant")
+                raise Exception(f"Entity {self._display_name(entity)} still exists in Qdrant after deletion")
+            self.logger.info(f"✅ Entity {self._display_name(entity)} confirmed removed from Qdrant")
         
         self.logger.info("✅ Partial deletion verification completed")
     
@@ -384,17 +399,27 @@ class VerifyPartialDeletionStep(TestStep):
     async def _verify_entity_deleted_from_qdrant(self, client, entity: Dict[str, Any]) -> bool:
         """Verify a specific entity has been removed from Qdrant."""
         try:
-            # Use token if available, otherwise use filename
+            # Use token if available, otherwise use title/url/id
             search_query = entity.get('token', entity.get('expected_content', ''))
             if not search_query:
-                # Fallback to filename for file-based entities
-                search_query = entity['path'].split('/')[-1]
+                # Fallbacks in order of reliability
+                fallback = (
+                    entity.get('title')
+                    or entity.get('url')
+                    or entity.get('id')
+                    or entity.get('path')
+                    or ''
+                )
+                # If it's a path-like string, reduce to filename
+                if isinstance(fallback, str) and '/' in fallback:
+                    fallback = fallback.rsplit('/', 1)[-1]
+                search_query = fallback
             
-            search_results = await client.search_collection(
-                collection_id=self.config._collection_readable_id,
+            search_results = client.collections.search_collection(
+                self.config._collection_readable_id,
                 query=search_query,
-                score_threshold=0.1  # Very low threshold to catch any matches
-            )
+                score_threshold=0.1,
+            ).model_dump()
             
             # Check if any results contain this entity
             results = search_results.get("results", [])
@@ -409,11 +434,13 @@ class VerifyPartialDeletionStep(TestStep):
                     return False
                 
                 # For file-based entities, check if this result contains the same file number
-                if search_query.startswith("datamonkey-test-"):
-                    file_number = search_query.split("-")[2]  # Extract file number
-                    if result_name.startswith(f"datamonkey-test-{file_number}-"):
-                        self.logger.warning(f"⚠️ Found entity with same file number: {result_name}")
-                        return False
+                if isinstance(search_query, str) and search_query.startswith("datamonkey-test-"):
+                    parts = search_query.split("-")
+                    if len(parts) > 2:
+                        file_number = parts[2]
+                        if result_name.startswith(f"datamonkey-test-{file_number}-"):
+                            self.logger.warning(f"⚠️ Found entity with same file number: {result_name}")
+                            return False
             
             return True
             
@@ -440,8 +467,8 @@ class VerifyRemainingEntitiesStep(TestStep):
         for entity in self.config._remaining_entities:
             is_present = await self._verify_entity_still_in_qdrant(client, entity)
             if not is_present:
-                raise Exception(f"Entity {entity['path']} was incorrectly removed from Qdrant")
-            self.logger.info(f"✅ Entity {entity['path']} confirmed still present in Qdrant")
+                raise Exception(f"Entity {self._display_name(entity)} was incorrectly removed from Qdrant")
+            self.logger.info(f"✅ Entity {self._display_name(entity)} confirmed still present in Qdrant")
         
         self.logger.info("✅ Remaining entities verification completed")
     
@@ -458,11 +485,11 @@ class VerifyRemainingEntitiesStep(TestStep):
                 # Fallback to filename for file-based entities
                 search_query = entity['path'].split('/')[-1]
             
-            search_results = await client.search_collection(
-                collection_id=self.config._collection_readable_id,
+            search_results = client.collections.search_collection(
+                self.config._collection_readable_id,
                 query=search_query,
-                score_threshold=0.2  # Lower threshold for token-based search
-            )
+                score_threshold=0.2,
+            ).model_dump()
             
             # Check if any results contain this entity
             results = search_results.get("results", [])
@@ -533,8 +560,8 @@ class VerifyCompleteDeletionStep(TestStep):
         for entity in all_test_entities:
             is_removed = await self._verify_entity_deleted_from_qdrant(client, entity)
             if not is_removed:
-                raise Exception(f"Entity {entity['path']} still exists in Qdrant after complete deletion")
-            self.logger.info(f"✅ Entity {entity['path']} confirmed removed from Qdrant")
+                raise Exception(f"Entity {self._display_name(entity)} still exists in Qdrant after complete deletion")
+            self.logger.info(f"✅ Entity {self._display_name(entity)} confirmed removed from Qdrant")
         
         # Verify collection is essentially empty (only metadata entities might remain)
         collection_empty = await self._verify_collection_empty_of_test_data(client)
@@ -554,11 +581,11 @@ class VerifyCompleteDeletionStep(TestStep):
         try:
             # Search for the entity using its filename
             filename = entity['path'].split('/')[-1]
-            search_results = await client.search_collection(
-                collection_id=self.config._collection_readable_id,
+            search_results = client.collections.search_collection(
+                self.config._collection_readable_id,
                 query=filename,
-                score_threshold=0.1  # Very low threshold to catch any matches
-            )
+                score_threshold=0.1,
+            ).model_dump()
             
             # Check if any results contain this entity
             results = search_results.get("results", [])
@@ -581,11 +608,11 @@ class VerifyCompleteDeletionStep(TestStep):
             total_test_results = 0
             
             for pattern in test_patterns:
-                search_results = await client.search_collection(
-                    collection_id=self.config._collection_readable_id,
+                search_results = client.collections.search_collection(
+                    self.config._collection_readable_id,
                     query=pattern,
-                    score_threshold=0.3  # Low threshold to catch any test data
-                )
+                    score_threshold=0.3,
+                ).model_dump()
                 
                 results = search_results.get("results", [])
                 total_test_results += len(results)

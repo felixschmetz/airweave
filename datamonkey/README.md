@@ -10,10 +10,10 @@ A scalable framework for testing connector sync flows end-to-end with real API i
 
 ```bash
 # Copy the environment template
-cp env.test.example env.test
+cp env.test .env
 
 # Edit with your credentials
-nano env.test
+nano .env
 ```
 
 ### 2. Install Dependencies
@@ -22,11 +22,19 @@ nano env.test
 pip install -r requirements.txt
 ```
 
-### 3. Run GitHub Test
+### 3. Run Tests
 
 ```bash
-python run_github_test.py
+# List available tests
+python list_tests.py
+
+# Run a specific test
+python test.py --config configs/notion.yaml
+python test.py --config configs/github.yaml
+python test.py --config configs/asana.yaml
 ```
+
+See [TESTING.md](TESTING.md) for detailed setup instructions.
 
 ## 🏗️ Architecture
 
@@ -48,18 +56,40 @@ python run_github_test.py
 
 ```
 datamonkey/
+├── auth/                    # Authentication
+│   ├── broker.py           # Auth provider interface
+│   └── credentials_resolver.py # Credential resolution
+├── bongos/                  # Real API integrations
+│   ├── base_bongo.py       # Abstract bongo base
+│   ├── registry.py         # Auto-discovery registry
+│   ├── asana.py            # Asana implementation
+│   ├── github.py           # GitHub implementation
+│   └── notion.py           # Notion implementation
+├── configs/                 # Test configurations
+│   ├── asana.yaml
+│   ├── github.yaml
+│   └── notion.yaml
 ├── core/                    # Core framework
-│   ├── base_datamonkey.py  # Abstract base class
-│   └── test_runner.py      # Test orchestration
-       ├── bongos/                 # Real API integrations
-       │   ├── base_bongo.py       # Abstract bongo base
-       │   └── github_bongo.py     # GitHub API integration
-       ├── connectors/              # Connector implementations
-       │   └── github_datamonkey.py # GitHub datamonkey
+│   ├── test_config.py      # Configuration management
+│   ├── test_flow.py        # Test execution engine
+│   ├── test_runner.py      # Test orchestration
+│   └── test_steps.py       # Individual test steps
+├── generation/              # Test data generation
+│   ├── schemas/            # Pydantic models (split by connector)
+│   │   ├── asana.py        # Asana schemas
+│   │   ├── github.py       # GitHub schemas
+│   │   └── notion.py       # Notion schemas
+│   ├── asana.py            # Asana content generator
+│   ├── github.py           # GitHub content generator
+│   └── notion.py           # Notion content generator
+├── client/                  # Clients
+│   ├── airweave.py         # Airweave API client
+│   └── llm.py              # LLM client
 ├── utils/                   # Utilities
-│   ├── airweave_client.py  # Airweave API client
 │   └── logging.py          # Rich logging
-       ├── run_github_test.py      # Main test runner
+├── test.py                  # Simple test runner
+├── list_tests.py           # List available tests
+├── TESTING.md              # Testing documentation
 ├── requirements.txt         # Dependencies
 └── env.test                # Test credentials (gitignored)
 ```
