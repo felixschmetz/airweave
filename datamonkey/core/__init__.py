@@ -1,0 +1,1 @@
+"""Core datamonkey functionality."""

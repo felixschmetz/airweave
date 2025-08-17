@@ -1,0 +1,25 @@
+# docker-compose.monke.yml
+# Used for monke testing
+
+services:
+  datamonkey-backend:
+    container_name: datamonkey-backend
+    build:
+      context: ../datamonkey
+      dockerfile: backend/Dockerfile
+    ports:
+      - "8081:8081"
+    restart: on-failure
+
+  datamonkey-frontend:
+    container_name: datamonkey-frontend
+    build:
+      context: ../datamonkey/frontend
+      dockerfile: Dockerfile
+    environment:
+      - VITE_API_BASE=http://localhost:8081
+    ports:
+      - "8082:8082"
+    depends_on:
+      - datamonkey-backend
+    restart: on-failure
