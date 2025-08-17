@@ -1,0 +1,122 @@
+name: Run Datamonkey Tests
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  run-tests:
+    name: Run Datamonkey Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start Airweave backend
+        run: |
+          printf 'n\nn\n' | ./start.sh
+
+      - name: Wait for Airweave backend health
+        run: |
+          for i in {1..60}; do
+            if curl -fsS http://localhost:8001/health >/dev/null; then 
+              echo "✅ Airweave backend is healthy"
+              exit 0
+            fi
+            echo "Waiting for Airweave backend... ($i/60)"
+            sleep 2
+          done
+          echo "❌ Airweave backend failed to become healthy"
+          exit 1
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      
+      - name: Install dependencies
+        run: |
+          cd monke
+          pip install -r requirements.txt
+
+      - name: Run Asana test
+        id: asana
+        continue-on-error: true
+        run: |
+          echo "🧪 Running Asana test..."
+          cd monke
+          python test.py --config configs/asana.yaml
+
+      - name: Run GitHub test
+        id: github
+        continue-on-error: true
+        run: |
+          echo "🧪 Running GitHub test..."
+          cd monke
+          python test.py --config configs/github.yaml
+
+      - name: Run Todoist test
+        id: todoist
+        continue-on-error: true
+        run: |
+          echo "🧪 Running Todoist test..."
+          cd monke
+          python test.py --config configs/todoist.yaml
+
+      - name: Collect logs on failure
+        if: failure()
+        run: |
+          echo "=== Airweave Backend Logs ==="
+          docker logs airweave-backend || true
+
+      - name: Report test results
+        if: always()
+        run: |
+          echo "## Test Results Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Check Asana test
+          if [ "${{ steps.asana.outcome }}" == "success" ]; then
+            echo "✅ **Asana test**: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Asana test**: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check GitHub test
+          if [ "${{ steps.github.outcome }}" == "success" ]; then
+            echo "✅ **GitHub test**: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **GitHub test**: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Check Todoist test
+          if [ "${{ steps.todoist.outcome }}" == "success" ]; then
+            echo "✅ **Todoist test**: PASSED" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "❌ **Todoist test**: FAILED" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Overall status
+          if [ "${{ steps.asana.outcome }}" == "success" ] && \
+             [ "${{ steps.github.outcome }}" == "success" ] && \
+             [ "${{ steps.todoist.outcome }}" == "success" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "🎉 **All tests passed!**" >> $GITHUB_STEP_SUMMARY
+            exit 0
+          else
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "💥 **Some tests failed!**" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          TODOIST_AUTH_PROVIDER_ACCOUNT_ID: ${{ secrets.TODOIST_AUTH_PROVIDER_ACCOUNT_ID }}
+          TODOIST_AUTH_PROVIDER_AUTH_CONFIG_ID: ${{ secrets.TODOIST_AUTH_PROVIDER_AUTH_CONFIG_ID }}
+          ASANA_AUTH_PROVIDER_ACCOUNT_ID: ${{ vars.ASANA_AUTH_PROVIDER_ACCOUNT_ID }}
+          ASANA_AUTH_PROVIDER_AUTH_CONFIG_ID: ${{ vars.ASANA_AUTH_PROVIDER_AUTH_CONFIG_ID }}
+          DM_AUTH_PROVIDER: ${{ vars.DM_AUTH_PROVIDER }}
+          DM_AUTH_PROVIDER_API_KEY: ${{ vars.DM_AUTH_PROVIDER_API_KEY }}
+          DM_AUTH_PROVIDER_ID: ${{ vars.DM_AUTH_PROVIDER_ID }}
+          NOTION_AUTH_PROVIDER_ACCOUNT_ID: ${{ vars.NOTION_AUTH_PROVIDER_ACCOUNT_ID }}
+          NOTION_AUTH_PROVIDER_AUTH_CONFIG_ID: ${{ vars.NOTION_AUTH_PROVIDER_AUTH_CONFIG_ID }}
