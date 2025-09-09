@@ -11,7 +11,10 @@
     "build": "tsc && chmod 755 build/index.js",
     "start": "node build/index.js",
     "dev": "npm run build && npm run start",
-    "test": "node test-build.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:llm": "node tests/run-llm-tests.js",
     "prepublishOnly": "npm run build"
   },
   "keywords": [
@@ -44,7 +47,9 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.7",
-    "typescript": "^5.7.3"
+    "typescript": "^5.7.3",
+    "vitest": "^2.0.0",
+    "@vitest/coverage-v8": "^2.0.0"
   },
   "files": [
     "build",
